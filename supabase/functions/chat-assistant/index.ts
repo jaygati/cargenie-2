@@ -7,11 +7,20 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
+interface CarModel {
+  id: string;
+  make: string;
+  model: string;
+  seats: number;
+  fuel_type: string;
+  body_type: string;
+  [key: string]: any;
+}
+
 interface UserRequirements {
   minSeats?: number;
   fuelType?: string;
   bodyType?: string;
-  budget?: string;
 }
 
 function extractRequirements(message: string, history: any[]): UserRequirements {
@@ -45,6 +54,55 @@ function extractRequirements(message: string, history: any[]): UserRequirements 
   return reqs;
 }
 
+function generateResponse(requirements: UserRequirements, carModels: CarModel[], userMessage: string): { message: string; recommendations: string[] } {
+  const parts: string[] = [];
+  const recommendedIds: string[] = [];
+
+  if (!carModels || carModels.length === 0) {
+    return {
+      message: "I couldn't find any cars matching your requirements. Could you tell me a bit more about what you're looking for?",
+      recommendations: []
+    };
+  }
+
+  if (requirements.minSeats || requirements.fuelType || requirements.bodyType) {
+    parts.push('Perfect! Based on your needs, I found some great options for you:');
+    
+    if (requirements.minSeats) {
+      parts.push(`\nYou mentioned needing ${requirements.minSeats}+ seats - I'm showing you vehicles with that capacity.`);
+    }
+    if (requirements.fuelType) {
+      parts.push(`You're interested in ${requirements.fuelType} vehicles, so I've filtered those.`);
+    }
+    if (requirements.bodyType) {
+      parts.push(`I found some ${requirements.bodyType} models that match your preferences.`);
+    }
+
+    const topModels = carModels.slice(0, 3);
+    if (topModels.length > 0) {
+      parts.push('\nHere are my recommendations:');
+      topModels.forEach(model => {
+        recommendedIds.push(model.id);
+        parts.push(`• ${model.make} ${model.model} (${model.seats} seats, ${model.fuel_type})`);
+      });
+    }
+
+    parts.push('\nClick "Show Available Deals" to see current listings, or ask me more questions!');
+  } else {
+    parts.push('I\'d love to help you find the perfect car! Could you tell me more about your needs?');
+    parts.push('\nFor example:');
+    parts.push('• How many seats do you need?');
+    parts.push('• What fuel type interests you? (gas, hybrid, electric)');
+    parts.push('• What body type? (sedan, SUV, truck, minivan)');
+    parts.push('\nJust describe what you\'re looking for and I\'ll show you the best matches!');
+  }
+
+  return {
+    message: parts.join('\n'),
+    recommendations: recommendedIds
+  };
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, {
@@ -75,129 +133,20 @@ Deno.serve(async (req: Request) => {
       query = query.eq('body_type', requirements.bodyType);
     }
     
-    const { data: carModels } = await query.limit(50);
+    const { data: carModels, error } = await query.limit(50);
 
-    const systemPrompt = `You are CarGenie, a helpful AI assistant for car recommendations.
-
-CRITICAL RULES - NEVER VIOLATE THESE:
-1. SEATING CAPACITY IS NON-NEGOTIABLE: If user needs seats for X people, ONLY recommend cars with X or MORE seats. A 5-seater CANNOT accommodate 7 people.
-2. When user says "family of X", they need AT LEAST X seats minimum.
-3. ALWAYS verify seat count matches requirements before recommending.
-4. If no cars match their strict requirements, tell them honestly - don't compromise on safety.
-
-Available car models (already filtered by requirements):
-${JSON.stringify(carModels, null, 2)}
-
-User Requirements Detected:
-${JSON.stringify(requirements, null, 2)}
-
-Your Response Format:
-- Be conversational and friendly
-- Ask clarifying questions if needs are unclear
-- When recommending, return ONLY this JSON structure:
-{
-  "message": "Your friendly response explaining why these cars work",
-  "recommendations": ["model_id_1", "model_id_2"]
-}
-- If just chatting without recommendations: { "message": "your response" }
-- NEVER recommend a car that doesn't meet the minimum requirements
-- Tell them to click "Show Available Deals" when ready
-
-Examples of GOOD responses:
-- Family of 7 → Only recommend 7+ seat SUVs/minivans
-- 5 passengers → 5+ seat vehicles are fine
-- Electric preference → Only electric cars
-
-Examples of BAD responses (NEVER DO THIS):
-- Family of 7 → DO NOT recommend 5-seat sedans
-- Need truck → DO NOT recommend sedans
-- Want electric → DO NOT recommend gas cars`;
-
-    const messages = [
-      {
-        role: "user",
-        parts: [{ text: systemPrompt }]
-      },
-      ...(conversationHistory || []).map((msg: any) => ({
-        role: msg.role === "assistant" ? "model" : "user",
-        parts: [{ text: msg.content }]
-      })),
-      {
-        role: "user",
-        parts: [{ text: message }]
-      }
-    ];
-
-    const geminiResponse = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${Deno.env.get("GEMINI_API_KEY")}`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          contents: messages,
-          generationConfig: {
-            temperature: 0.7,
-            maxOutputTokens: 800,
-          },
-        }),
-      }
-    );
-
-    if (!geminiResponse.ok) {
-      const errorText = await geminiResponse.text();
-      console.error("Gemini API error:", errorText);
-      throw new Error(`Gemini API error: ${geminiResponse.status}`);
+    if (error) {
+      throw error;
     }
 
-    const geminiData = await geminiResponse.json();
-    let assistantMessage = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    
-    assistantMessage = assistantMessage.replace(/```json\n?/g, '').replace(/```\n?/g, '');
-
-    let parsedResponse;
-    try {
-      const jsonMatch = assistantMessage.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        parsedResponse = JSON.parse(jsonMatch[0]);
-      } else {
-        parsedResponse = { message: assistantMessage };
-      }
-    } catch {
-      parsedResponse = { message: assistantMessage };
-    }
-
-    let recommendedModels = [];
-    if (parsedResponse.recommendations && Array.isArray(parsedResponse.recommendations)) {
-      const modelIds = parsedResponse.recommendations;
-      let modelQuery = supabase
-        .from("car_models")
-        .select("*")
-        .in("id", modelIds);
-      
-      if (requirements.minSeats) {
-        modelQuery = modelQuery.gte('seats', requirements.minSeats);
-      }
-      if (requirements.fuelType) {
-        modelQuery = modelQuery.eq('fuel_type', requirements.fuelType);
-      }
-      if (requirements.bodyType) {
-        modelQuery = modelQuery.eq('body_type', requirements.bodyType);
-      }
-      
-      const { data: models } = await modelQuery;
-      recommendedModels = models || [];
-      
-      if (recommendedModels.length === 0 && requirements.minSeats) {
-        parsedResponse.message = `I notice you need seating for ${requirements.minSeats} people. Unfortunately, none of the cars I suggested meet that requirement. Let me find vehicles with at least ${requirements.minSeats} seats for you.`;
-      }
-    }
+    const response = generateResponse(requirements, carModels || [], message);
 
     return new Response(
       JSON.stringify({
-        message: parsedResponse.message || assistantMessage,
-        models: recommendedModels,
+        message: response.message,
+        models: carModels && carModels.length > 0
+          ? carModels.filter(m => response.recommendations.includes(m.id))
+          : []
       }),
       {
         headers: {
@@ -210,8 +159,9 @@ Examples of BAD responses (NEVER DO THIS):
     console.error("Error:", error);
     return new Response(
       JSON.stringify({
-        error: error.message,
-        message: "I'm having trouble processing that right now. Could you try rephrasing your question?",
+        error: String(error),
+        message: "Sorry, I encountered an error. Please try again!",
+        models: []
       }),
       {
         status: 500,
